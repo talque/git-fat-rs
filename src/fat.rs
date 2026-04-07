@@ -1,9 +1,12 @@
 use sha1::{Sha1, Digest};
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
+
+use crate::backend::{self, Backend};
 
 pub const BLOCK_SIZE: usize = 4096 * 1024;  // 4MB
 pub const COOKIE: &str = "#$# git-fat ";
@@ -70,6 +73,28 @@ impl GitFat {
 
     pub fn filter_smudge<R: Read, W: Write>(&self, instream: R, outstream: W) -> io::Result<()> {
         filter_smudge_impl(&self.obj_dir, instream, outstream)
+    }
+
+    /// Load the backend specified in `.gitfat`, optionally selecting by name.
+    pub fn load_backend(&self, name: Option<&str>) -> io::Result<Box<dyn Backend>> {
+        backend::load_backend(self.obj_dir.clone(), &self.config_path, name)
+    }
+
+    /// Return the set of fat object digests present in the local cache.
+    pub fn cached_objects(&self) -> io::Result<HashSet<String>> {
+        if !self.obj_dir.exists() {
+            return Ok(HashSet::new());
+        }
+        let mut set = HashSet::new();
+        for entry in fs::read_dir(&self.obj_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                if let Some(name) = entry.file_name().to_str() {
+                    set.insert(name.to_string());
+                }
+            }
+        }
+        Ok(set)
     }
 }
 

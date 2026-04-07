@@ -1,3 +1,4 @@
+mod backend;
 mod fat;
 
 use clap::{Parser, Subcommand};
