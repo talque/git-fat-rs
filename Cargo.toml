@@ -1,0 +1,18 @@
+[package]
+name = "git-fat-rs"
+version = "0.1.0"
+edition = "2024"
+authors = ["E. Madison Bray <madison.bray@real-life-interaction.de>"]
+description = "Rust implementation of git-fat: large file support for Git"
+license = "MIT"
+repository = "https://github.com/talque/git-fat-rs"
+
+[[bin]]
+name = "git-fat"
+path = "src/main.rs"
+
+[dependencies]
+git2 = "0.20.4"
+hex = "0.4.3"
+sha1 = "0.11.0"
+tempfile = "3.27.0"
