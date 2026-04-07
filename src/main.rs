@@ -1,137 +1,100 @@
-use sha1::{Sha1, Digest};
-use std::env;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::path::{PathBuf};
-use tempfile::NamedTempFile;
+mod fat;
 
-const BLOCK_SIZE: usize = 4096 * 1024 * 1024;  // 4MB
-const COOKIE: &str = "#$# git-fat ";
+use clap::{Parser, Subcommand};
+use std::io;
+use std::path::PathBuf;
 
+#[derive(Parser)]
+#[command(name = "git-fat", about = "Large file support for Git")]
+struct Cli {
+    /// Enable verbose output
+    #[arg(short, long, global = true)]
+    verbose: bool,
 
-fn git_dir() -> PathBuf {
-    match env::var("GIT_DIR") {
-        Ok(val) => PathBuf::from(val),
-        Err(_) => usage(Some("GIT_DIR is not set; cannot determine git directory"))
-    }
+    /// Enable debug output
+    #[arg(short, long, global = true)]
+    debug: bool,
+
+    /// Path to .gitfat config file
+    #[arg(short, long, global = true, value_name = "FILE")]
+    config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Command,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Git clean filter: convert a large file to a fat placeholder
+    FilterClean,
 
-fn git_common_dir() -> PathBuf {
-    let git_dir = git_dir();
+    /// Git smudge filter: restore a fat placeholder to the original file
+    FilterSmudge,
 
-    // Check if in a worktree
-    if git_dir.parent()
-        .and_then(|p| p.file_name())
-        .map(|f| f == "worktrees")
-        .unwrap_or(false)
-    {
-        return git_dir.parent().unwrap().parent().unwrap().to_path_buf();
-    }
+    /// Push fat objects to the remote store
+    Push {
+        /// Backend name to use (default: first in .gitfat)
+        backend: Option<String>,
+    },
 
-    git_dir
+    /// Pull fat objects from the remote store
+    Pull {
+        /// Backend name to use (default: first in .gitfat), or a file pattern
+        backend_or_pattern: Option<String>,
+        /// Additional file patterns to pull
+        patterns: Vec<String>,
+    },
+
+    /// Restore placeholder files in the working tree that have objects in the cache
+    Checkout,
+
+    /// Find files in repository history over a size threshold
+    Find {
+        /// Minimum file size in bytes
+        size: u64,
+    },
+
+    /// Show orphan (referenced but not cached) and stale (cached but not referenced) objects
+    Status,
+
+    /// List all git-fat managed files: digest -> path
+    List,
+
+    /// Convert files to git-fat placeholders (for use with git filter-branch --index-filter)
+    IndexFilter {
+        /// File containing list of paths to convert
+        filelist: PathBuf,
+
+        /// Do not update .gitattributes
+        #[arg(short = 'x', long = "no-gitattributes")]
+        no_gitattributes: bool,
+    },
 }
-
-
-fn obj_dir() -> PathBuf {
-    let git_dir = git_common_dir();
-    git_dir.join("fat/objects")
-}
-
-
-fn encode_placeholder(digest: &str, size: usize) -> Vec<u8> {
-    format!("{}{} {:20}\n", COOKIE, digest, size).into_bytes()
-}
-
-
-fn read_blocks<R: Read>(reader: &mut R) -> io::Result<impl Iterator<Item=io::Result<Vec<u8>>>> {
-    Ok(std::iter::from_fn(move || {
-        let mut buf = vec![0u8; BLOCK_SIZE];
-        match reader.read(&mut buf) {
-            Ok(0) => None,
-            Ok(n) => Some(Ok(buf[..n].to_vec())),
-            Err(e) => Some(Err(e)),
-        }
-    }))
-}
-
-
-fn filter_clean<R: Read, W: Write>(mut instream: R, mut outstream: W) -> io::Result<()> {
-    let objdir = obj_dir();
-    fs::create_dir_all(&objdir)?;
-
-    let mut temp = NamedTempFile::new_in(&objdir)?;
-    let mut hash = Sha1::new();
-    let mut total_size = 0;
-
-    for block in read_blocks(&mut instream)? {
-        let block = block?;
-        hash.update(&block);
-        total_size += block.len();
-        temp.write_all(&block)?;
-    }
-
-    let digest = hex::encode(hash.finalize());
-    let objfile = objdir.join(&digest);
-
-    if !objfile.exists() {
-        temp.persist(&objfile)?;
-        let mut perms = fs::metadata(&objfile)?.permissions();
-        perms.set_readonly(true);
-        fs::set_permissions(&objfile, perms)?;
-    }
-
-    outstream.write_all(&encode_placeholder(&digest, total_size))?;
-    Ok(())
-}
-
-
-fn filter_smudge<R: Read, W: Write>(mut instream: R, mut outstream: W) -> io::Result<()> {
-    let objdir = obj_dir();
-    let mut first_block = vec![0u8; 1024];
-    let n = instream.read(&mut first_block)?;
-    first_block.truncate(n);
-
-    if first_block.starts_with(COOKIE.as_bytes()) {
-        let parts: Vec<&[u8]> = first_block.split(|&b| b == b' ').collect();
-        if parts.len() >= 3 {
-            let digest = String::from_utf8_lossy(parts[2]);
-            let objfile = objdir.join(digest.trim());
-            if objfile.exists() {
-                let mut f = File::open(&objfile)?;
-                io::copy(&mut f, &mut outstream)?;
-                return Ok(());
-            }
-        }
-    }
-
-    // Not a fat object, just copy the original data
-    outstream.write_all(&first_block)?;
-    io::copy(&mut instream, &mut outstream)?;
-    Ok(())
-}
-
-
-fn usage(msg: Option<&str>) -> ! {
-    msg.map(|m| eprintln!("{}", m));
-    eprintln!("Usage: git-fat <filter-clean|filter-smudge>");
-    std::process::exit(1);
-}
-
 
 fn main() -> io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        usage(None);
-    }
+    let cli = Cli::parse();
 
-    let cmd = &args[1];
-    match cmd.as_str() {
-        "filter-clean" => filter_clean(io::stdin(), io::stdout())?,
-        "filter-smudge" => filter_smudge(io::stdin(), io::stdout())?,
-        _ => {
-            usage(Some(format!("Unknown command: {}", cmd).as_str()));
+    match &cli.command {
+        // Filter commands are hot-path: open GitFat (which opens git2 repo), then run
+        Command::FilterClean => {
+            let gf = fat::GitFat::new(cli.verbose, cli.debug, cli.config.clone())?;
+            gf.filter_clean(io::stdin(), io::stdout())
+        }
+        Command::FilterSmudge => {
+            let gf = fat::GitFat::new(cli.verbose, cli.debug, cli.config.clone())?;
+            gf.filter_smudge(io::stdin(), io::stdout())
+        }
+
+        // Remaining commands; not yet implemented
+        Command::Push { .. }
+        | Command::Pull { .. }
+        | Command::Checkout
+        | Command::Find { .. }
+        | Command::Status
+        | Command::List
+        | Command::IndexFilter { .. } => {
+            eprintln!("Command not yet implemented");
+            std::process::exit(1);
         }
     }
-    Ok(())
 }

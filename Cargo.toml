@@ -12,6 +12,7 @@ name = "git-fat"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 git2 = "0.20.4"
 hex = "0.4.3"
 sha1 = "0.11.0"
