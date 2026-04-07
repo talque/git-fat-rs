@@ -9,6 +9,7 @@ use tempfile::NamedTempFile;
 use crate::backend::{self, Backend};
 
 pub const BLOCK_SIZE: usize = 4096 * 1024;  // 4MB
+pub const PREFIX_SIZE: usize = 1024;
 pub const COOKIE: &str = "#$# git-fat ";
 
 
@@ -96,6 +97,84 @@ impl GitFat {
         }
         Ok(set)
     }
+
+    /// Walk the HEAD tree and return (repo-relative path, fat-digest) for every
+    /// blob whose content is a fat placeholder.
+    pub fn managed_files(&self) -> io::Result<Vec<(PathBuf, String)>> {
+        let head = match self.repo.head() {
+            Ok(h) => h,
+            Err(_) => return Ok(vec![]),  // empty / unborn repo
+        };
+        let tree = head
+            .peel_to_commit()
+            .and_then(|c| c.tree())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        let mut results: Vec<(PathBuf, String)> = Vec::new();
+
+        tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+            if entry.kind() != Some(git2::ObjectType::Blob) {
+                return git2::TreeWalkResult::Ok;
+            }
+            let path = PathBuf::from(dir).join(entry.name().unwrap_or(""));
+            if let Ok(blob) = self.repo.find_blob(entry.id()) {
+                if let Ok(digest) = extract_digest(blob.content()) {
+                    results.push((path, digest));
+                }
+            }
+            git2::TreeWalkResult::Ok
+        })
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        Ok(results)
+    }
+
+    /// Return (digest, repo-relative path) for working-tree files that still
+    /// contain a fat placeholder (i.e. have not been smudged).
+    pub fn orphan_files(&self) -> io::Result<Vec<(String, PathBuf)>> {
+        let workdir = self.repo.workdir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no working directory"))?
+            .to_path_buf();
+
+        let mut orphans = Vec::new();
+        for (path, _head_digest) in self.managed_files()? {
+            let full_path = workdir.join(&path);
+            if !full_path.is_file() {
+                continue;
+            }
+            // Read only enough bytes to detect the cookie
+            let mut f = File::open(&full_path)?;
+            let prefix = read_prefix(&mut f, PREFIX_SIZE)?;
+            if let Ok(digest) = extract_digest(&prefix) {
+                orphans.push((digest, path));
+            }
+        }
+        Ok(orphans)
+    }
+
+    /// Restore working-tree files that are still fat placeholders but whose
+    /// objects are present in the local cache.
+    pub fn checkout(&self, show_orphans: bool) -> io::Result<()> {
+        let workdir = self.repo.workdir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no working directory"))?
+            .to_path_buf();
+
+        for (digest, path) in self.orphan_files()? {
+            let obj_path = self.obj_dir.join(&digest);
+            if obj_path.exists() {
+                eprintln!("Restoring {} -> {}", digest, path.display());
+                fs::remove_file(workdir.join(&path))?;
+                std::process::Command::new("git")
+                    .args(["checkout-index", "--index", "--force", "--"])
+                    .arg(&path)
+                    .current_dir(&workdir)
+                    .status()?;
+            } else if show_orphans {
+                eprintln!("Data unavailable: {} {}", digest, path.display());
+            }
+        }
+        Ok(())
+    }
 }
 
 
@@ -125,6 +204,28 @@ pub fn git_common_dir(git_dir: &PathBuf) -> PathBuf {
 
 pub fn encode_placeholder(digest: &str, size: usize) -> Vec<u8> {
     format!("{}{} {:20}\n", COOKIE, digest, size).into_bytes()
+}
+
+
+pub fn read_prefix<R: Read>(reader: &mut R, size: usize) -> io::Result<Vec<u8>> {
+    let mut first_block = vec![0u8; size];
+    let n = reader.read(&mut first_block)?;
+    first_block.truncate(n);
+    Ok(first_block)
+}
+
+
+pub fn extract_digest(block: &[u8]) -> Result<String, &str> {
+    if !block.starts_with(COOKIE.as_bytes()) {
+        return Err("not a git-fat placeholder file");
+    }
+
+    let parts: Vec<&[u8]> = block.split(|&b| b == b' ').collect();
+    if parts.len() < 3 {
+        return Err("not a git-fat placeholder file");
+    }
+
+    Ok(String::from_utf8_lossy(parts[2]).to_string())
 }
 
 
@@ -178,20 +279,13 @@ pub fn filter_smudge_impl<R: Read, W: Write>(
     mut instream: R,
     mut outstream: W,
 ) -> io::Result<()> {
-    let mut first_block = vec![0u8; 1024];
-    let n = instream.read(&mut first_block)?;
-    first_block.truncate(n);
-
-    if first_block.starts_with(COOKIE.as_bytes()) {
-        let parts: Vec<&[u8]> = first_block.split(|&b| b == b' ').collect();
-        if parts.len() >= 3 {
-            let digest = String::from_utf8_lossy(parts[2]);
-            let objfile = objdir.join(digest.trim());
-            if objfile.exists() {
-                let mut f = File::open(&objfile)?;
-                io::copy(&mut f, &mut outstream)?;
-                return Ok(());
-            }
+    let first_block = read_prefix(&mut instream, PREFIX_SIZE)?;
+    if let Ok(digest) = extract_digest(&first_block) {
+        let objfile = objdir.join(digest.trim());
+        if objfile.exists() {
+            let mut f = File::open(&objfile)?;
+            io::copy(&mut f, &mut outstream)?;
+            return Ok(());
         }
     }
 

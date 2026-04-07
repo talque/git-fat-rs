@@ -74,22 +74,24 @@ enum Command {
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
+    let gf = fat::GitFat::new(cli.verbose, cli.debug, cli.config.clone())?;
 
     match &cli.command {
-        // Filter commands are hot-path: open GitFat (which opens git2 repo), then run
+        Command:: Checkout => {
+            gf.checkout(false)
+        }
+
         Command::FilterClean => {
-            let gf = fat::GitFat::new(cli.verbose, cli.debug, cli.config.clone())?;
             gf.filter_clean(io::stdin(), io::stdout())
         }
+
         Command::FilterSmudge => {
-            let gf = fat::GitFat::new(cli.verbose, cli.debug, cli.config.clone())?;
             gf.filter_smudge(io::stdin(), io::stdout())
         }
 
         // Remaining commands; not yet implemented
         Command::Push { .. }
         | Command::Pull { .. }
-        | Command::Checkout
         | Command::Find { .. }
         | Command::Status
         | Command::List
