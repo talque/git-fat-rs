@@ -9,7 +9,7 @@ const BLOCK_SIZE: usize = 4096 * 1024 * 1024;  // 4MB
 const COOKIE: &str = "#$# git-fat ";
 
 
-fn repo_git_dir() -> PathBuf {
+fn git_dir() -> PathBuf {
     match env::var("GIT_DIR") {
         Ok(val) => PathBuf::from(val),
         Err(_) => usage(Some("GIT_DIR is not set; cannot determine git directory"))
@@ -17,8 +17,24 @@ fn repo_git_dir() -> PathBuf {
 }
 
 
+fn git_common_dir() -> PathBuf {
+    let git_dir = git_dir();
+
+    // Check if in a worktree
+    if git_dir.parent()
+        .and_then(|p| p.file_name())
+        .map(|f| f == "worktrees")
+        .unwrap_or(false)
+    {
+        return git_dir.parent().unwrap().parent().unwrap().to_path_buf();
+    }
+
+    git_dir
+}
+
+
 fn obj_dir() -> PathBuf {
-    let git_dir = repo_git_dir();
+    let git_dir = git_common_dir();
     git_dir.join("fat/objects")
 }
 
@@ -79,7 +95,7 @@ fn filter_smudge<R: Read, W: Write>(mut instream: R, mut outstream: W) -> io::Re
     if first_block.starts_with(COOKIE.as_bytes()) {
         let parts: Vec<&[u8]> = first_block.split(|&b| b == b' ').collect();
         if parts.len() >= 3 {
-            let digest = String::from_utf8_lossy(parts[1]);
+            let digest = String::from_utf8_lossy(parts[2]);
             let objfile = objdir.join(digest.trim());
             if objfile.exists() {
                 let mut f = File::open(&objfile)?;
