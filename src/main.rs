@@ -1,5 +1,6 @@
 mod backend;
 mod fat;
+mod git;
 
 use clap::{Parser, Subcommand};
 use std::io;

@@ -1,12 +1,12 @@
 use sha1::{Sha1, Digest};
 use std::collections::HashSet;
-use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
 
 use crate::backend::{self, Backend};
+use crate::git::{self, ManagedFiles};
 
 pub const BLOCK_SIZE: usize = 4096 * 1024;  // 4MB
 pub const PREFIX_SIZE: usize = 1024;
@@ -28,8 +28,8 @@ impl GitFat {
         let repo = git2::Repository::open_from_env()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        let git_dir = git_dir();
-        let obj_dir = git_common_dir(&git_dir).join("fat/objects");
+        let git_dir = git::git_dir();
+        let obj_dir = git::git_common_dir(&git_dir).join("fat/objects");
 
         let config_path = config_path.unwrap_or_else(|| {
             repo.workdir()
@@ -98,35 +98,8 @@ impl GitFat {
         Ok(set)
     }
 
-    /// Walk the HEAD tree and return (repo-relative path, fat-digest) for every
-    /// blob whose content is a fat placeholder.
-    pub fn managed_files(&self) -> io::Result<Vec<(PathBuf, String)>> {
-        let head = match self.repo.head() {
-            Ok(h) => h,
-            Err(_) => return Ok(vec![]),  // empty / unborn repo
-        };
-        let tree = head
-            .peel_to_commit()
-            .and_then(|c| c.tree())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-        let mut results: Vec<(PathBuf, String)> = Vec::new();
-
-        tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
-            if entry.kind() != Some(git2::ObjectType::Blob) {
-                return git2::TreeWalkResult::Ok;
-            }
-            let path = PathBuf::from(dir).join(entry.name().unwrap_or(""));
-            if let Ok(blob) = self.repo.find_blob(entry.id()) {
-                if let Ok(digest) = extract_digest(blob.content()) {
-                    results.push((path, digest));
-                }
-            }
-            git2::TreeWalkResult::Ok
-        })
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-        Ok(results)
+    pub fn managed_files(&self) -> impl Iterator<Item = io::Result<(PathBuf, String, usize)>> + '_ {
+        ManagedFiles::new(&self.repo)
     }
 
     /// Return (digest, repo-relative path) for working-tree files that still
@@ -137,7 +110,8 @@ impl GitFat {
             .to_path_buf();
 
         let mut orphans = Vec::new();
-        for (path, _head_digest) in self.managed_files()? {
+        for result in self.managed_files() {
+            let (path, _, _) = result?;
             let full_path = workdir.join(&path);
             if !full_path.is_file() {
                 continue;
@@ -175,33 +149,15 @@ impl GitFat {
         }
         Ok(())
     }
+
+    // Find any files over size threshold in the repository.
+    pub fn find(&self, _size: usize) -> io::Result<()> {
+        todo!()
+    }
 }
 
 
 // Shared helpers used by both GitFat methods and standalone filter functions
-pub fn git_dir() -> PathBuf {
-    match env::var("GIT_DIR") {
-        Ok(val) => PathBuf::from(val),
-        Err(_) => {
-            eprintln!("GIT_DIR is not set; cannot determine git directory");
-            std::process::exit(1);
-        }
-    }
-}
-
-
-pub fn git_common_dir(git_dir: &PathBuf) -> PathBuf {
-    if git_dir.parent()
-        .and_then(|p| p.file_name())
-        .map(|f| f == "worktrees")
-        .unwrap_or(false)
-    {
-        return git_dir.parent().unwrap().parent().unwrap().to_path_buf();
-    }
-    git_dir.clone()
-}
-
-
 pub fn encode_placeholder(digest: &str, size: usize) -> Vec<u8> {
     format!("{}{} {:20}\n", COOKIE, digest, size).into_bytes()
 }
