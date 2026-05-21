@@ -70,45 +70,57 @@ impl GitFat {
         Ok(())
     }
 
-    pub fn filter_clean<R: Read, W: Write>(&self, instream: R, outstream: W) -> io::Result<()> {
+    pub fn filter_clean<R: Read, W: Write>(&self, mut instream: R, mut outstream: W) -> io::Result<()> {
         self.configure()?;
-        filter_clean_impl(&self.obj_dir, instream, outstream)
+        let objdir = &self.obj_dir;
+        fs::create_dir_all(objdir)?;
+
+        let mut temp = NamedTempFile::new_in(objdir)?;
+        let mut hash = Sha1::new();
+        let mut total_size = 0;
+
+        for block in read_blocks(&mut instream)? {
+            let block = block?;
+            hash.update(&block);
+            total_size += block.len();
+            temp.write_all(&block)?;
+        }
+
+        let digest = hex::encode(hash.finalize());
+        let objfile = objdir.join(&digest);
+
+        if !objfile.exists() {
+            temp.persist(&objfile)?;
+            let mut perms = fs::metadata(&objfile)?.permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(&objfile, perms)?;
+        }
+
+        outstream.write_all(&encode_placeholder(&digest, total_size))?;
+        Ok(())
     }
 
-    pub fn filter_smudge<R: Read, W: Write>(&self, instream: R, outstream: W) -> io::Result<()> {
-        filter_smudge_impl(&self.obj_dir, instream, outstream)
+    pub fn filter_smudge<R: Read, W: Write>(&self, mut instream: R, mut outstream: W) -> io::Result<()> {
+        let objdir = &self.obj_dir;
+        let first_block = read_prefix(&mut instream, PREFIX_SIZE)?;
+        if let Ok(digest) = extract_digest(&first_block) {
+            let objfile = objdir.join(digest.trim());
+            if objfile.exists() {
+                let mut f = File::open(&objfile)?;
+                io::copy(&mut f, &mut outstream)?;
+                return Ok(());
+            }
+        }
+
+        // Not a fat object; pass through as-is
+        outstream.write_all(&first_block)?;
+        io::copy(&mut instream, &mut outstream)?;
+        Ok(())
     }
 
     /// Load the backend specified in `.gitfat`, optionally selecting by name.
     pub fn load_backend(&self, name: Option<&str>) -> io::Result<Box<dyn Backend>> {
         backend::load_backend(self.obj_dir.clone(), &self.config_path, name)
-    }
-
-    /// Return the set of fat object digests present in the local cache.
-    pub fn cached_objects(&self) -> io::Result<HashSet<String>> {
-        if !self.obj_dir.exists() {
-            return Ok(HashSet::new());
-        }
-        let mut set = HashSet::new();
-        for entry in fs::read_dir(&self.obj_dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                if let Some(name) = entry.file_name().to_str() {
-                    set.insert(name.to_string());
-                }
-            }
-        }
-        Ok(set)
-    }
-
-    fn head_tree(&self) -> io::Result<Option<git2::Tree<'_>>> {
-        match self.repo.head() {
-            Err(_) => Ok(None),
-            Ok(head) => Ok(Some(
-                head.peel_to_tree()
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-            )),
-        }
     }
 
     /// Return (digest, repo-relative path) for working-tree files that still
@@ -117,37 +129,24 @@ impl GitFat {
         let workdir = self.repo.workdir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no working directory"))?
             .to_path_buf();
-        let tree = match self.head_tree()? {
-            Some(t) => t,
-            None => return Ok(vec![]),
-        };
-        let odb = self.repo.odb()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         let mut orphans = Vec::new();
-        let mut walk_err: Option<io::Error> = None;
 
-        tree.walk(TreeWalkMode::PreOrder, |dir, entry| {
-            if !is_fat_placeholder(entry, &odb) {
-                return TreeWalkResult::Ok;
-            }
+        self.walk_tree(|dir, entry, odb| {
+            if !is_fat_placeholder(entry, odb) { return Ok(()); }
 
             let path = PathBuf::from(dir).join(entry.name().unwrap_or_default());
             let full_path = workdir.join(&path);
-            if !full_path.is_file() { return TreeWalkResult::Ok; }
+            if !full_path.is_file() { return Ok(()); }
 
-            match File::open(&full_path).and_then(|mut f| read_prefix(&mut f, PREFIX_SIZE)) {
-                Err(e) => walk_err = Some(e),
-                Ok(prefix) => {
-                    if let Ok(digest) = extract_digest(&prefix) {
-                        orphans.push((digest, path));
-                    }
-                }
+            let prefix = File::open(&full_path)
+                .and_then(|mut f| read_prefix(&mut f, PREFIX_SIZE))?;
+            if let Ok(digest) = extract_digest(&prefix) {
+                orphans.push((digest, path));
             }
-            TreeWalkResult::Ok
-        }).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            Ok(())
+        })?;
 
-        if let Some(e) = walk_err { return Err(e); }
         Ok(orphans)
     }
 
@@ -177,49 +176,72 @@ impl GitFat {
 
     /// Find any files over a size threshold in the repository.
     pub fn find(&self, min_size: usize) -> io::Result<()> {
-        let tree = match self.head_tree()? {
-            Some(t) => t,
-            None => return Ok(()),
-        };
-        let odb = self.repo.odb()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-        tree.walk(TreeWalkMode::PreOrder, |dir, entry| {
+        self.walk_tree(|dir, entry, odb| {
+            if entry.kind() != Some(git2::ObjectType::Blob) { return Ok(()); }
             if let Ok((size, _)) = odb.read_header(entry.id()) {
                 if size > min_size {
                     let path = PathBuf::from(dir).join(entry.name().unwrap_or_default());
                     println!("{} {} {}", entry.id(), size, path.display());
                 }
-            };
-            TreeWalkResult::Ok
-        }).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            }
+            Ok(())
+        })
     }
 
     /// List all git-fat managed files: fat-digest and repo-relative path.
     pub fn list(&self) -> io::Result<()> {
-        let tree = match self.head_tree()? {
-            Some(t) => t,
-            None => return Ok(()),
-        };
-        let odb = self.repo.odb()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-        tree.walk(TreeWalkMode::PreOrder, |dir, entry| {
-            if !is_fat_placeholder(entry, &odb) {
-                return TreeWalkResult::Ok;
-            }
-
+        self.walk_tree(|dir, entry, odb| {
+            if !is_fat_placeholder(entry, odb) { return Ok(()); }
             if let Ok(blob) = self.repo.find_blob(entry.id()) {
                 if let Ok(digest) = extract_digest(blob.content()) {
                     let path = PathBuf::from(dir).join(entry.name().unwrap_or_default());
                     println!("{} {}", digest.trim(), path.display());
                 }
             }
-            TreeWalkResult::Ok
-        }).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            Ok(())
+        })
+    }
+
+    fn head_tree(&self) -> io::Result<Option<git2::Tree<'_>>> {
+        match self.repo.head() {
+            Err(_) => Ok(None),
+            Ok(head) => Ok(Some(
+                head.peel_to_tree()
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            )),
+        }
+    }
+
+    // Walk the HEAD tree, passing each entry and the ODB to the callback.
+    // Returning Err from the callback aborts the walk and propagates the error.
+    fn walk_tree<F>(&self, mut callback: F) -> io::Result<()>
+    where
+        F: FnMut(&str, &git2::TreeEntry<'_>, &git2::Odb<'_>) -> io::Result<()>,
+    {
+        let tree = match self.head_tree()? {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let odb = self.repo.odb()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        let mut walk_err: Option<io::Error> = None;
+
+        let walk_result = tree.walk(TreeWalkMode::PreOrder, |dir, entry| {
+            match callback(dir, entry, &odb) {
+                Ok(()) => TreeWalkResult::Ok,
+                Err(e) => { walk_err = Some(e); TreeWalkResult::Abort }
+            }
+        });
+
+        if let Some(e) = walk_err { return Err(e); }
+        walk_result.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
 }
 
+
+/// Misc utility functions
+///
 
 fn is_fat_placeholder(entry: &git2::TreeEntry<'_>, odb: &git2::Odb<'_>) -> bool {
     entry.kind() == Some(git2::ObjectType::Blob)
@@ -264,59 +286,4 @@ pub fn read_blocks<R: Read>(reader: &mut R) -> io::Result<impl Iterator<Item=io:
             Err(e) => Some(Err(e)),
         }
     }))
-}
-
-
-fn filter_clean_impl<R: Read, W: Write>(
-    objdir: &std::path::Path,
-    mut instream: R,
-    mut outstream: W,
-) -> io::Result<()> {
-    fs::create_dir_all(objdir)?;
-
-    let mut temp = NamedTempFile::new_in(objdir)?;
-    let mut hash = Sha1::new();
-    let mut total_size = 0;
-
-    for block in read_blocks(&mut instream)? {
-        let block = block?;
-        hash.update(&block);
-        total_size += block.len();
-        temp.write_all(&block)?;
-    }
-
-    let digest = hex::encode(hash.finalize());
-    let objfile = objdir.join(&digest);
-
-    if !objfile.exists() {
-        temp.persist(&objfile)?;
-        let mut perms = fs::metadata(&objfile)?.permissions();
-        perms.set_readonly(true);
-        fs::set_permissions(&objfile, perms)?;
-    }
-
-    outstream.write_all(&encode_placeholder(&digest, total_size))?;
-    Ok(())
-}
-
-
-fn filter_smudge_impl<R: Read, W: Write>(
-    objdir: &std::path::Path,
-    mut instream: R,
-    mut outstream: W,
-) -> io::Result<()> {
-    let first_block = read_prefix(&mut instream, PREFIX_SIZE)?;
-    if let Ok(digest) = extract_digest(&first_block) {
-        let objfile = objdir.join(digest.trim());
-        if objfile.exists() {
-            let mut f = File::open(&objfile)?;
-            io::copy(&mut f, &mut outstream)?;
-            return Ok(());
-        }
-    }
-
-    // Not a fat object; pass through as-is
-    outstream.write_all(&first_block)?;
-    io::copy(&mut instream, &mut outstream)?;
-    Ok(())
 }
