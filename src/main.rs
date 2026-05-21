@@ -97,10 +97,13 @@ fn main() -> io::Result<()> {
             gf.list()
         }
 
+        Command::Status => {
+            gf.status()
+        }
+
         // Remaining commands; not yet implemented
         Command::Push { .. }
         | Command::Pull { .. }
-        | Command::Status
         | Command::IndexFilter { .. } => {
             eprintln!("Command not yet implemented");
             std::process::exit(1);

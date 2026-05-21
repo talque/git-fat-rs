@@ -202,6 +202,44 @@ impl GitFat {
         })
     }
 
+    /// Show orphan (in tree, but not in cache) and stale (in cache,
+    /// but not in tree) objects, if any.
+    pub fn status(&self) -> io::Result<()> {
+        let cached = self.cached_objects()?;
+        let managed = self.managed_objects()?;
+        let mut stale = cached.difference(&managed).peekable();
+        let mut orphans = managed.difference(&cached).peekable();
+
+        if orphans.peek().is_some() {
+            println!("Orphan objects:");
+            orphans.for_each(|n| println!("\t {n}"));
+        }
+
+        if stale.peek().is_some() {
+            println!("Stale objects:");
+            stale.for_each(|n| println!("\t {n}"));
+        }
+
+        Ok(())
+    }
+
+    /// Return the set of object digests present in the local cache.
+    fn cached_objects(&self) -> io::Result<HashSet<String>> {
+        if !self.obj_dir.exists() {
+            return Ok(HashSet::new());
+        }
+        let mut set = HashSet::new();
+        for entry in fs::read_dir(&self.obj_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                if let Some(name) = entry.file_name().to_str() {
+                    set.insert(name.to_string());
+                }
+            }
+        }
+        Ok(set)
+    }
+
     fn head_tree(&self) -> io::Result<Option<git2::Tree<'_>>> {
         match self.repo.head() {
             Err(_) => Ok(None),
@@ -210,6 +248,21 @@ impl GitFat {
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
             )),
         }
+    }
+
+    // Return the set of fat content digests referenced in the HEAD tree
+    fn managed_objects(&self) -> io::Result<HashSet<String>> {
+        let mut set = HashSet::new();
+        self.walk_tree(|_dir, entry, odb| {
+            if !is_fat_placeholder(entry, odb) { return Ok(()); }
+            if let Ok(blob) = self.repo.find_blob(entry.id()) {
+                if let Ok(digest) = extract_digest(blob.content()) {
+                    set.insert(digest.trim().to_string());
+                }
+            }
+            Ok(())
+        })?;
+        Ok(set)
     }
 
     // Walk the HEAD tree, passing each entry and the ODB to the callback.
