@@ -5,12 +5,15 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
 
+use git2::{self, Repository, TreeWalkMode, TreeWalkResult};
+
 use crate::backend::{self, Backend};
-use crate::git::{ManagedFiles};
 
 pub const BLOCK_SIZE: usize = 4096 * 1024;  // 4MB
 pub const PREFIX_SIZE: usize = 1024;
 pub const COOKIE: &str = "#$# git-fat ";
+// Length of a git-fat placeholder: COOKIE + 40-hex + ' ' + 20-padded-decimal + '\n'
+pub const MAGICLEN: usize = 74;
 
 
 pub struct GitFat {
@@ -25,7 +28,7 @@ pub struct GitFat {
 
 impl GitFat {
     pub fn new(verbose: bool, debug: bool, config_path: Option<PathBuf>) -> io::Result<Self> {
-        let repo = git2::Repository::open_from_env()
+        let repo = Repository::open_from_env()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         let git_dir = repo.path().to_path_buf();
@@ -98,8 +101,14 @@ impl GitFat {
         Ok(set)
     }
 
-    pub fn managed_files(&self) -> impl Iterator<Item = io::Result<(PathBuf, git2::Oid, usize)>> + '_ {
-        ManagedFiles::new(&self.repo)
+    fn head_tree(&self) -> io::Result<Option<git2::Tree<'_>>> {
+        match self.repo.head() {
+            Err(_) => Ok(None),
+            Ok(head) => Ok(Some(
+                head.peel_to_tree()
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            )),
+        }
     }
 
     /// Return (digest, repo-relative path) for working-tree files that still
@@ -108,21 +117,37 @@ impl GitFat {
         let workdir = self.repo.workdir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no working directory"))?
             .to_path_buf();
+        let tree = match self.head_tree()? {
+            Some(t) => t,
+            None => return Ok(vec![]),
+        };
+        let odb = self.repo.odb()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         let mut orphans = Vec::new();
-        for result in self.managed_files() {
-            let (path, _oid, _size) = result?;
+        let mut walk_err: Option<io::Error> = None;
+
+        tree.walk(TreeWalkMode::PreOrder, |dir, entry| {
+            if !is_fat_placeholder(entry, &odb) {
+                return TreeWalkResult::Ok;
+            }
+
+            let path = PathBuf::from(dir).join(entry.name().unwrap_or_default());
             let full_path = workdir.join(&path);
-            if !full_path.is_file() {
-                continue;
+            if !full_path.is_file() { return TreeWalkResult::Ok; }
+
+            match File::open(&full_path).and_then(|mut f| read_prefix(&mut f, PREFIX_SIZE)) {
+                Err(e) => walk_err = Some(e),
+                Ok(prefix) => {
+                    if let Ok(digest) = extract_digest(&prefix) {
+                        orphans.push((digest, path));
+                    }
+                }
             }
-            // Read only enough bytes to detect the cookie
-            let mut f = File::open(&full_path)?;
-            let prefix = read_prefix(&mut f, PREFIX_SIZE)?;
-            if let Ok(digest) = extract_digest(&prefix) {
-                orphans.push((digest, path));
-            }
-        }
+            TreeWalkResult::Ok
+        }).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        if let Some(e) = walk_err { return Err(e); }
         Ok(orphans)
     }
 
@@ -150,16 +175,55 @@ impl GitFat {
         Ok(())
     }
 
-    // Find any files over size threshold in the repository.
-    pub fn find(&self, size: usize) -> io::Result<()> {
-        for result in self.managed_files() {
-            let (path, oid, objsize) = result?;
-            if objsize > size {
-                println!("{} {} {}", oid, objsize, path.display());
-            }
-        }
-        Ok(())
+    /// Find any files over a size threshold in the repository.
+    pub fn find(&self, min_size: usize) -> io::Result<()> {
+        let tree = match self.head_tree()? {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let odb = self.repo.odb()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        tree.walk(TreeWalkMode::PreOrder, |dir, entry| {
+            if let Ok((size, _)) = odb.read_header(entry.id()) {
+                if size > min_size {
+                    let path = PathBuf::from(dir).join(entry.name().unwrap_or_default());
+                    println!("{} {} {}", entry.id(), size, path.display());
+                }
+            };
+            TreeWalkResult::Ok
+        }).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
+
+    /// List all git-fat managed files: fat-digest and repo-relative path.
+    pub fn list(&self) -> io::Result<()> {
+        let tree = match self.head_tree()? {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let odb = self.repo.odb()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        tree.walk(TreeWalkMode::PreOrder, |dir, entry| {
+            if !is_fat_placeholder(entry, &odb) {
+                return TreeWalkResult::Ok;
+            }
+
+            if let Ok(blob) = self.repo.find_blob(entry.id()) {
+                if let Ok(digest) = extract_digest(blob.content()) {
+                    let path = PathBuf::from(dir).join(entry.name().unwrap_or_default());
+                    println!("{} {}", digest.trim(), path.display());
+                }
+            }
+            TreeWalkResult::Ok
+        }).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+}
+
+
+fn is_fat_placeholder(entry: &git2::TreeEntry<'_>, odb: &git2::Odb<'_>) -> bool {
+    entry.kind() == Some(git2::ObjectType::Blob)
+        && odb.read_header(entry.id()).map_or(false, |(size, _)| size == MAGICLEN)
 }
 
 

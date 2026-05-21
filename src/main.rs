@@ -1,6 +1,5 @@
 mod backend;
 mod fat;
-mod git;
 
 use clap::{Parser, Subcommand};
 use std::io;
@@ -94,11 +93,14 @@ fn main() -> io::Result<()> {
             gf.find(*size)
         }
 
+        Command::List => {
+            gf.list()
+        }
+
         // Remaining commands; not yet implemented
         Command::Push { .. }
         | Command::Pull { .. }
         | Command::Status
-        | Command::List
         | Command::IndexFilter { .. } => {
             eprintln!("Command not yet implemented");
             std::process::exit(1);
