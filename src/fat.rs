@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use tempfile::NamedTempFile;
 
 use crate::backend::{self, Backend};
-use crate::git::{self, ManagedFiles};
+use crate::git::{ManagedFiles};
 
 pub const BLOCK_SIZE: usize = 4096 * 1024;  // 4MB
 pub const PREFIX_SIZE: usize = 1024;
@@ -28,8 +28,8 @@ impl GitFat {
         let repo = git2::Repository::open_from_env()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        let git_dir = git::git_dir();
-        let obj_dir = git::git_common_dir(&git_dir).join("fat/objects");
+        let git_dir = repo.path().to_path_buf();
+        let obj_dir = repo.commondir().join("fat/objects");
 
         let config_path = config_path.unwrap_or_else(|| {
             repo.workdir()
@@ -98,7 +98,7 @@ impl GitFat {
         Ok(set)
     }
 
-    pub fn managed_files(&self) -> impl Iterator<Item = io::Result<(PathBuf, String, usize)>> + '_ {
+    pub fn managed_files(&self) -> impl Iterator<Item = io::Result<(PathBuf, git2::Oid, usize)>> + '_ {
         ManagedFiles::new(&self.repo)
     }
 
@@ -111,7 +111,7 @@ impl GitFat {
 
         let mut orphans = Vec::new();
         for result in self.managed_files() {
-            let (path, _, _) = result?;
+            let (path, _oid, _size) = result?;
             let full_path = workdir.join(&path);
             if !full_path.is_file() {
                 continue;
@@ -151,8 +151,14 @@ impl GitFat {
     }
 
     // Find any files over size threshold in the repository.
-    pub fn find(&self, _size: usize) -> io::Result<()> {
-        todo!()
+    pub fn find(&self, size: usize) -> io::Result<()> {
+        for result in self.managed_files() {
+            let (path, oid, objsize) = result?;
+            if objsize > size {
+                println!("{} {} {}", oid, objsize, path.display());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -197,7 +203,7 @@ pub fn read_blocks<R: Read>(reader: &mut R) -> io::Result<impl Iterator<Item=io:
 }
 
 
-pub fn filter_clean_impl<R: Read, W: Write>(
+fn filter_clean_impl<R: Read, W: Write>(
     objdir: &std::path::Path,
     mut instream: R,
     mut outstream: W,
@@ -230,7 +236,7 @@ pub fn filter_clean_impl<R: Read, W: Write>(
 }
 
 
-pub fn filter_smudge_impl<R: Read, W: Write>(
+fn filter_smudge_impl<R: Read, W: Write>(
     objdir: &std::path::Path,
     mut instream: R,
     mut outstream: W,

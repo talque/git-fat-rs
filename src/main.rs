@@ -53,7 +53,7 @@ enum Command {
     /// Find files in repository history over a size threshold
     Find {
         /// Minimum file size in bytes
-        size: u64,
+        size: usize,
     },
 
     /// Show orphan (referenced but not cached) and stale (cached but not referenced) objects
@@ -90,10 +90,13 @@ fn main() -> io::Result<()> {
             gf.filter_smudge(io::stdin(), io::stdout())
         }
 
+        Command::Find { size } => {
+            gf.find(*size)
+        }
+
         // Remaining commands; not yet implemented
         Command::Push { .. }
         | Command::Pull { .. }
-        | Command::Find { .. }
         | Command::Status
         | Command::List
         | Command::IndexFilter { .. } => {
