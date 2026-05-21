@@ -17,12 +17,13 @@ pub const MAGICLEN: usize = 74;
 
 
 pub struct GitFat {
-    pub repo: git2::Repository,
-    pub git_dir: PathBuf,
-    pub obj_dir: PathBuf,
-    pub config_path: PathBuf,
-    pub verbose: bool,
-    pub debug: bool,
+    repo: git2::Repository,
+    obj_dir: PathBuf,
+    config_path: PathBuf,
+    #[allow(dead_code)]
+    verbose: bool,
+    #[allow(dead_code)]
+    debug: bool,
 }
 
 
@@ -40,7 +41,9 @@ impl GitFat {
                 .join(".gitfat")
         });
 
-        Ok(GitFat { repo, git_dir, obj_dir, config_path, verbose, debug })
+        let gf = GitFat{ repo, obj_dir, config_path, verbose, debug };
+        gf.configure()?;
+        Ok(gf)
     }
 
     /// Auto-configure git-fat for this repository.
@@ -71,7 +74,6 @@ impl GitFat {
     }
 
     pub fn filter_clean<R: Read, W: Write>(&self, mut instream: R, mut outstream: W) -> io::Result<()> {
-        self.configure()?;
         let objdir = &self.obj_dir;
         fs::create_dir_all(objdir)?;
 
@@ -200,6 +202,38 @@ impl GitFat {
             }
             Ok(())
         })
+    }
+
+    /// Push locally cached fat objects that are referenced in HEAD to the remote.
+    pub fn push(&self, backend_name: Option<&str>) -> io::Result<()> {
+        let backend = self.load_backend(backend_name)?;
+        let files: HashSet<String> = self.managed_objects()?
+            .intersection(&self.cached_objects()?)
+            .cloned()
+            .collect();
+        eprintln!("Pushing {} objects", files.len());
+        if !backend.push_files(&files)? {
+            return Err(io::Error::new(io::ErrorKind::Other, "push failed"));
+        }
+        Ok(())
+    }
+
+    /// Pull fat objects referenced in HEAD that are not yet cached locally,
+    /// then checkout any newly available files.
+    pub fn pull(&self, backend_name: Option<&str>) -> io::Result<()> {
+        let backend = self.load_backend(backend_name)?;
+        let files: HashSet<String> = self.managed_objects()?
+            .difference(&self.cached_objects()?)
+            .cloned()
+            .collect();
+        if files.is_empty() {
+            return Ok(());
+        }
+        eprintln!("Pulling {} objects", files.len());
+        if !backend.pull_files(&files)? {
+            return Err(io::Error::new(io::ErrorKind::Other, "pull failed"));
+        }
+        self.checkout(false)
     }
 
     /// Show orphan (in tree, but not in cache) and stale (in cache,

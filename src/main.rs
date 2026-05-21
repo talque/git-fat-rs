@@ -26,11 +26,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Initialize configuration for git-fat filters
+    Init,
+
     /// Git clean filter: convert a large file to a fat placeholder
-    FilterClean,
+    FilterClean {
+        /// Filename being filtered (passed by git via %f)
+        filename: Option<String>,
+    },
 
     /// Git smudge filter: restore a fat placeholder to the original file
-    FilterSmudge,
+    FilterSmudge {
+        /// Filename being filtered (passed by git via %f)
+        filename: Option<String>,
+    },
 
     /// Push fat objects to the remote store
     Push {
@@ -77,15 +86,19 @@ fn main() -> io::Result<()> {
     let gf = fat::GitFat::new(cli.verbose, cli.debug, cli.config.clone())?;
 
     match &cli.command {
-        Command:: Checkout => {
+        Command::Init => {
+            Ok(())
+        }
+
+        Command::Checkout => {
             gf.checkout(false)
         }
 
-        Command::FilterClean => {
+        Command::FilterClean { .. } => {
             gf.filter_clean(io::stdin(), io::stdout())
         }
 
-        Command::FilterSmudge => {
+        Command::FilterSmudge { .. } => {
             gf.filter_smudge(io::stdin(), io::stdout())
         }
 
@@ -101,10 +114,15 @@ fn main() -> io::Result<()> {
             gf.status()
         }
 
-        // Remaining commands; not yet implemented
-        Command::Push { .. }
-        | Command::Pull { .. }
-        | Command::IndexFilter { .. } => {
+        Command::Push { backend } => {
+            gf.push(backend.as_deref())
+        }
+
+        Command::Pull { backend_or_pattern, .. } => {
+            gf.pull(backend_or_pattern.as_deref())
+        }
+
+        Command::IndexFilter { .. } => {
             eprintln!("Command not yet implemented");
             std::process::exit(1);
         }
