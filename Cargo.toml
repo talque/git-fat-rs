@@ -1,6 +1,6 @@
 [package]
 name = "git-fat-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["E. Madison Bray <madison.bray@real-life-interaction.de>"]
 description = "Rust implementation of git-fat: large file support for Git"
