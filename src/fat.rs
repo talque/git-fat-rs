@@ -3,7 +3,7 @@ use sha1::{Sha1, Digest};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 use git2::{self, Repository, TreeWalkMode, TreeWalkResult};
@@ -30,9 +30,7 @@ pub struct GitFat {
 
 impl GitFat {
     pub fn new(verbose: bool, debug: bool, config_path: Option<PathBuf>) -> io::Result<Self> {
-        let repo = Repository::open_from_env()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
+        let repo = Repository::open_from_env().map_err(other_err)?;
         let git_dir = repo.path().to_path_buf();
         let obj_dir = repo.commondir().join("fat/objects");
 
@@ -52,24 +50,19 @@ impl GitFat {
     /// Sets filter.fat.clean and filter.fat.smudge in git config only if they
     /// are not already set; ensures the objdir is created.
     pub fn configure(&self) -> io::Result<()> {
-        let mut cfg = self.repo.config()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let mut cfg = self.repo.config().map_err(other_err)?;
 
-        if cfg.get_string("filter.fat.clean").is_err() {
-            println!("Setting filter.fat.clean in git config");
-            cfg.set_str("filter.fat.clean", "git-fat filter-clean %f")
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        }
-        if cfg.get_string("filter.fat.smudge").is_err() {
-            println!("Setting filter.fat.smudge in git config");
-            cfg.set_str("filter.fat.smudge", "git-fat filter-smudge %f")
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        if cfg.get_string("filter.fat.clean").is_ok()
+            && cfg.get_string("filter.fat.smudge").is_ok()
+            && self.obj_dir.is_dir() {
+            return Ok(());
         }
 
-        if !self.obj_dir.exists() {
-            println!("Creating {}", self.obj_dir.display());
-            fs::create_dir_all(&self.obj_dir)?;
-        }
+        println!("Setting filters in .git/config");
+        cfg.set_str("filter.fat.clean", "git-fat filter-clean %f").map_err(other_err)?;
+        cfg.set_str("filter.fat.smudge", "git-fat filter-smudge %f").map_err(other_err)?;
+        println!("Creating {}", self.obj_dir.display());
+        fs::create_dir_all(&self.obj_dir)?;
 
         println!("Initialized git-fat");
         Ok(())
@@ -148,7 +141,7 @@ impl GitFat {
     /// contain a fat placeholder (i.e. have not been smudged).
     pub fn orphan_files(&self) -> io::Result<Vec<(String, PathBuf)>> {
         let workdir = self.repo.workdir()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no working directory"))?
+            .ok_or_else(|| other_err("no working directory"))?
             .to_path_buf();
 
         let mut orphans = Vec::new();
@@ -175,7 +168,7 @@ impl GitFat {
     /// objects are present in the local cache.
     pub fn checkout(&self, show_orphans: bool) -> io::Result<()> {
         let workdir = self.repo.workdir()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no working directory"))?
+            .ok_or_else(|| other_err("no working directory"))?
             .to_path_buf();
 
         for (digest, path) in self.orphan_files()? {
@@ -232,7 +225,7 @@ impl GitFat {
             .collect();
         log::debug!("PUSH: pushing {} objects", files.len());
         if !backend.push_files(&files)? {
-            return Err(io::Error::new(io::ErrorKind::Other, "push failed"));
+            return Err(other_err("push failed"));
         }
         Ok(())
     }
@@ -250,9 +243,90 @@ impl GitFat {
         }
         log::debug!("PULL: pulling {} objects", files.len());
         if !backend.pull_files(&files)? {
-            return Err(io::Error::new(io::ErrorKind::Other, "pull failed"));
+            return Err(other_err("pull failed"));
         }
         self.checkout(false)
+    }
+
+    /// Convert files to fat placeholders in the index, for use with
+    /// `git filter-branch --index-filter`.
+    ///
+    /// Reads a list of filenames from `filelist`, then for each staged file
+    /// whose name appears in that list, replaces its blob with a fat
+    /// placeholder blob.  Optionally appends `filter=fat -text` lines to
+    /// `.gitattributes` in the index.
+    pub fn index_filter(&self, filelist: &Path, update_gitattributes: bool) -> io::Result<()> {
+        let workdir = self.obj_dir.parent()
+            .ok_or_else(|| other_err("invalid object dir"))?
+            .join("index-filter");
+        fs::create_dir_all(&workdir)?;
+
+        let content = fs::read_to_string(filelist)?;
+        let files_to_convert: HashSet<&str> = content.lines().collect();
+
+        let mut index = self.repo.index().map_err(other_err)?;
+
+        // Collect first: can't modify the index while iterating it
+        let entries: Vec<git2::IndexEntry> = index.iter().collect();
+        let mut newfiles: Vec<String> = Vec::new();
+
+        for mut entry in entries {
+            let filename = String::from_utf8_lossy(&entry.path).to_string();
+            // mode == 0o120000 == symbolic link
+            if entry.mode == 0o120000 || !files_to_convert.contains(filename.as_str()) {
+                continue;
+            }
+
+            let cache_path = workdir.join(entry.id.to_string());
+            let new_oid = if cache_path.exists() {
+                let s = fs::read_to_string(&cache_path)?;
+                git2::Oid::from_str(s.trim()).map_err(other_err)?
+            } else {
+                let blob = self.repo.find_blob(entry.id).map_err(other_err)?;
+                let mut placeholder: Vec<u8> = Vec::new();
+                self.filter_clean(None, blob.content(), &mut placeholder)?;
+                let oid = self.repo.blob(&placeholder).map_err(other_err)?;
+                fs::write(&cache_path, format!("{oid}\n"))?;
+                oid
+            };
+
+            entry.id = new_oid;
+            index.add(&entry).map_err(other_err)?;
+            newfiles.push(filename);
+        }
+
+        if update_gitattributes && !newfiles.is_empty() {
+            let (ga_mode, ga_content) = match index.get_path(Path::new(".gitattributes"), 0) {
+                Some(e) => {
+                    let content = self.repo.find_blob(e.id)
+                        .map(|b| String::from_utf8_lossy(b.content()).to_string())
+                        .unwrap_or_default();
+                    (e.mode, content)
+                }
+                None => (0o100644u32, String::new()),
+            };
+
+            let mut new_ga = ga_content;
+            for f in &newfiles {
+                new_ga.push_str(&format!("{f} filter=fat -text\n"));
+            }
+
+            let ga_oid = self.repo.blob(new_ga.as_bytes()).map_err(other_err)?;
+            index.add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0, ino: 0, uid: 0, gid: 0,
+                mode: ga_mode,
+                file_size: new_ga.len() as u32,
+                id: ga_oid,
+                flags: 0,
+                flags_extended: 0,
+                path: b".gitattributes".to_vec(),
+            }).map_err(other_err)?;
+        }
+
+        index.write().map_err(other_err)?;
+        Ok(())
     }
 
     /// Show orphan (in tree, but not in cache) and stale (in cache,
@@ -297,8 +371,7 @@ impl GitFat {
         match self.repo.head() {
             Err(_) => Ok(None),
             Ok(head) => Ok(Some(
-                head.peel_to_tree()
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                head.peel_to_tree().map_err(other_err)?
             )),
         }
     }
@@ -328,9 +401,7 @@ impl GitFat {
             Some(t) => t,
             None => return Ok(()),
         };
-        let odb = self.repo.odb()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
+        let odb = self.repo.odb().map_err(other_err)?;
         let mut walk_err: Option<io::Error> = None;
 
         let walk_result = tree.walk(TreeWalkMode::PreOrder, |dir, entry| {
@@ -341,7 +412,7 @@ impl GitFat {
         });
 
         if let Some(e) = walk_err { return Err(e); }
-        walk_result.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        walk_result.map_err(other_err)
     }
 }
 
@@ -356,12 +427,12 @@ fn is_fat_placeholder(entry: &git2::TreeEntry<'_>, odb: &git2::Odb<'_>) -> bool 
 
 
 // Shared helpers used by both GitFat methods and standalone filter functions
-pub fn encode_placeholder(digest: &str, size: usize) -> Vec<u8> {
+fn encode_placeholder(digest: &str, size: usize) -> Vec<u8> {
     format!("{}{} {:20}\n", COOKIE, digest, size).into_bytes()
 }
 
 
-pub fn read_prefix<R: Read>(reader: &mut R, size: usize) -> io::Result<Vec<u8>> {
+fn read_prefix<R: Read>(reader: &mut R, size: usize) -> io::Result<Vec<u8>> {
     let mut first_block = vec![0u8; size];
     let n = reader.read(&mut first_block)?;
     first_block.truncate(n);
@@ -369,7 +440,7 @@ pub fn read_prefix<R: Read>(reader: &mut R, size: usize) -> io::Result<Vec<u8>> 
 }
 
 
-pub fn extract_digest(block: &[u8]) -> Result<String, &str> {
+fn extract_digest(block: &[u8]) -> Result<String, &str> {
     if !block.starts_with(COOKIE.as_bytes()) {
         return Err("not a git-fat placeholder file");
     }
@@ -383,7 +454,7 @@ pub fn extract_digest(block: &[u8]) -> Result<String, &str> {
 }
 
 
-pub fn read_blocks<R: Read>(reader: &mut R) -> io::Result<impl Iterator<Item=io::Result<Vec<u8>>> + '_> {
+fn read_blocks<R: Read>(reader: &mut R) -> io::Result<impl Iterator<Item=io::Result<Vec<u8>>> + '_> {
     Ok(std::iter::from_fn(move || {
         let mut buf = vec![0u8; BLOCK_SIZE];
         match reader.read(&mut buf) {
@@ -392,4 +463,11 @@ pub fn read_blocks<R: Read>(reader: &mut R) -> io::Result<impl Iterator<Item=io:
             Err(e) => Some(Err(e)),
         }
     }))
+}
+
+
+/// Most functions return an io::Result so this is a helper to wrap arbitrary
+/// errors as io::Error with io::ErrorKind::Other.
+fn other_err(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, e)
 }

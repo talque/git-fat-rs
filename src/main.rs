@@ -134,9 +134,8 @@ fn main() -> io::Result<()> {
             gf.pull(backend_or_pattern.as_deref())
         }
 
-        Command::IndexFilter { .. } => {
-            eprintln!("Command not yet implemented");
-            std::process::exit(1);
+        Command::IndexFilter { filelist, no_gitattributes } => {
+            gf.index_filter(filelist, !no_gitattributes)
         }
     }
 }
