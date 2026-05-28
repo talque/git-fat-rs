@@ -1,3 +1,4 @@
+use log;
 use sha1::{Sha1, Digest};
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -55,25 +56,34 @@ impl GitFat {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         if cfg.get_string("filter.fat.clean").is_err() {
-            eprintln!("Setting filter.fat.clean in git config");
+            println!("Setting filter.fat.clean in git config");
             cfg.set_str("filter.fat.clean", "git-fat filter-clean %f")
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         }
         if cfg.get_string("filter.fat.smudge").is_err() {
-            eprintln!("Setting filter.fat.smudge in git config");
+            println!("Setting filter.fat.smudge in git config");
             cfg.set_str("filter.fat.smudge", "git-fat filter-smudge %f")
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         }
 
         if !self.obj_dir.exists() {
-            eprintln!("Creating {}", self.obj_dir.display());
+            println!("Creating {}", self.obj_dir.display());
             fs::create_dir_all(&self.obj_dir)?;
         }
 
+        println!("Initialized git-fat");
         Ok(())
     }
 
-    pub fn filter_clean<R: Read, W: Write>(&self, mut instream: R, mut outstream: W) -> io::Result<()> {
+    pub fn filter_clean<R: Read, W: Write>(
+        &self, filename: Option<&str>, mut instream: R, mut outstream: W) -> io::Result<()> {
+
+        log::debug!("CLEAN: filename={filename:?}");
+
+        if let Some(filename) = filename {
+            log::info!("Adding {filename}");
+        }
+
         let objdir = &self.obj_dir;
         fs::create_dir_all(objdir)?;
 
@@ -96,13 +106,17 @@ impl GitFat {
             let mut perms = fs::metadata(&objfile)?.permissions();
             perms.set_readonly(true);
             fs::set_permissions(&objfile, perms)?;
+            log::info!("git-fat filter-clean: caching to {}", objfile.display());
         }
 
         outstream.write_all(&encode_placeholder(&digest, total_size))?;
         Ok(())
     }
 
-    pub fn filter_smudge<R: Read, W: Write>(&self, mut instream: R, mut outstream: W) -> io::Result<()> {
+    pub fn filter_smudge<R: Read, W: Write>(
+        &self, filename: Option<&str>, mut instream: R, mut outstream: W) -> io::Result<()> {
+
+        log::debug!("SMUDGE: filename={filename:?}");
         let objdir = &self.obj_dir;
         let first_block = read_prefix(&mut instream, PREFIX_SIZE)?;
         if let Ok(digest) = extract_digest(&first_block) {
@@ -110,11 +124,16 @@ impl GitFat {
             if objfile.exists() {
                 let mut f = File::open(&objfile)?;
                 io::copy(&mut f, &mut outstream)?;
+                log::info!("git-fat filter-smudge: restoring from {}", objfile.display());
                 return Ok(());
+            } else {
+                log::info!("git-fat filter-smudge: fat object not found in cache")
             }
+        } else {
+            // Not a fat object; pass through as-is
+            log::info!("git-fat filter-smudge: not a managed file")
         }
 
-        // Not a fat object; pass through as-is
         outstream.write_all(&first_block)?;
         io::copy(&mut instream, &mut outstream)?;
         Ok(())
@@ -162,7 +181,7 @@ impl GitFat {
         for (digest, path) in self.orphan_files()? {
             let obj_path = self.obj_dir.join(&digest);
             if obj_path.exists() {
-                eprintln!("Restoring {} -> {}", digest, path.display());
+                println!("Restoring {} -> {}", digest, path.display());
                 fs::remove_file(workdir.join(&path))?;
                 std::process::Command::new("git")
                     .args(["checkout-index", "--index", "--force", "--"])
@@ -170,7 +189,7 @@ impl GitFat {
                     .current_dir(&workdir)
                     .status()?;
             } else if show_orphans {
-                eprintln!("Data unavailable: {} {}", digest, path.display());
+                println!("Data unavailable: {} {}", digest, path.display());
             }
         }
         Ok(())
@@ -211,7 +230,7 @@ impl GitFat {
             .intersection(&self.cached_objects()?)
             .cloned()
             .collect();
-        eprintln!("Pushing {} objects", files.len());
+        log::debug!("PUSH: pushing {} objects", files.len());
         if !backend.push_files(&files)? {
             return Err(io::Error::new(io::ErrorKind::Other, "push failed"));
         }
@@ -229,7 +248,7 @@ impl GitFat {
         if files.is_empty() {
             return Ok(());
         }
-        eprintln!("Pulling {} objects", files.len());
+        log::debug!("PULL: pulling {} objects", files.len());
         if !backend.pull_files(&files)? {
             return Err(io::Error::new(io::ErrorKind::Other, "pull failed"));
         }

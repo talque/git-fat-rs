@@ -5,6 +5,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use log;
+
 /// Backend trait
 pub trait Backend {
     /// Upload the given set of fat objects (identified by digest) to the remote.
@@ -31,6 +33,8 @@ impl CopyBackend {
                 format!("copy backend remote is not a directory: {}", remote.display()),
             ));
         }
+        log::debug!("CopyBackend: other_path={}, base_dir={}",
+            remote.display(), base_dir.display());
         Ok(CopyBackend { remote, base_dir })
     }
 }
@@ -126,6 +130,9 @@ impl RsyncBackend {
             cmd.arg(format!("--rsh={}", rsh));
         }
 
+        let cmd_name = if push { "push" } else { "pull" };
+        log::debug!("rsync {cmd_name} command: {cmd:?}");
+
         cmd
     }
 
@@ -179,6 +186,8 @@ pub fn load_backend(
     // We can use git2::Config for this since it is actually just a plain
     // INI-style parser.
     let cfg = git2::Config::open(config_path).map_err(|e| {
+        log::warn!("This does not appear to be a repository managed by git-fat. \
+                   Missing config file at: {}", config_path.display());
         io::Error::new(io::ErrorKind::Other, format!("cannot open {}: {}", config_path.display(), e))
     })?;
 

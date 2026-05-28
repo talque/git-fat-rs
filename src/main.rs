@@ -5,6 +5,8 @@ use clap::{Parser, Subcommand};
 use std::io;
 use std::path::PathBuf;
 
+use log::LevelFilter;
+
 #[derive(Parser)]
 #[command(name = "git-fat", about = "Large file support for Git")]
 struct Cli {
@@ -83,6 +85,16 @@ enum Command {
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
+
+    let level = if cli.debug {
+        LevelFilter::Debug
+    } else if cli.verbose {
+        LevelFilter::Info
+    } else {
+        LevelFilter::Warn
+    };
+    env_logger::Builder::new().filter_level(level).init();
+
     let gf = fat::GitFat::new(cli.verbose, cli.debug, cli.config.clone())?;
 
     match &cli.command {
@@ -94,12 +106,12 @@ fn main() -> io::Result<()> {
             gf.checkout(false)
         }
 
-        Command::FilterClean { .. } => {
-            gf.filter_clean(io::stdin(), io::stdout())
+        Command::FilterClean { filename } => {
+            gf.filter_clean(filename.as_deref(), io::stdin(), io::stdout())
         }
 
-        Command::FilterSmudge { .. } => {
-            gf.filter_smudge(io::stdin(), io::stdout())
+        Command::FilterSmudge { filename } => {
+            gf.filter_smudge(filename.as_deref(), io::stdin(), io::stdout())
         }
 
         Command::Find { size } => {
