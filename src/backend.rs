@@ -7,6 +7,8 @@ use std::process::{Command, Stdio};
 
 use log;
 
+use crate::util::other_err;
+
 /// Backend trait
 pub trait Backend {
     /// Upload the given set of fat objects (identified by digest) to the remote.
@@ -30,11 +32,17 @@ impl CopyBackend {
         if !remote.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("copy backend remote is not a directory: {}", remote.display()),
+                format!(
+                    "copy backend remote is not a directory: {}",
+                    remote.display()
+                ),
             ));
         }
-        log::debug!("CopyBackend: other_path={}, base_dir={}",
-            remote.display(), base_dir.display());
+        log::debug!(
+            "CopyBackend: other_path={}, base_dir={}",
+            remote.display(),
+            base_dir.display()
+        );
         Ok(CopyBackend { remote, base_dir })
     }
 }
@@ -48,7 +56,10 @@ impl Backend for CopyBackend {
                 continue;
             }
             fs::copy(&src, &dst).map_err(|e| {
-                io::Error::new(e.kind(), format!("copy {} -> {}: {}", src.display(), dst.display(), e))
+                io::Error::new(
+                    e.kind(),
+                    format!("copy {} -> {}: {}", src.display(), dst.display(), e),
+                )
             })?;
             set_readonly(&dst)?;
         }
@@ -64,13 +75,15 @@ impl Backend for CopyBackend {
                 continue;
             }
             fs::copy(&src, &dst).map_err(|e| {
-                io::Error::new(e.kind(), format!("copy {} -> {}: {}", src.display(), dst.display(), e))
+                io::Error::new(
+                    e.kind(),
+                    format!("copy {} -> {}: {}", src.display(), dst.display(), e),
+                )
             })?;
         }
         Ok(true)
     }
 }
-
 
 /// RsyncBackend: push/pull via rsync over SSH or rsyncd
 pub struct RsyncBackend {
@@ -102,9 +115,15 @@ impl RsyncBackend {
 
     fn build_command(&self, push: bool) -> Command {
         let (src, dst) = if push {
-            (format!("{}/", self.base_dir.display()), format!("{}/", self.remote_url))
+            (
+                format!("{}/", self.base_dir.display()),
+                format!("{}/", self.remote_url),
+            )
         } else {
-            (format!("{}/", self.remote_url), format!("{}/", self.base_dir.display()))
+            (
+                format!("{}/", self.remote_url),
+                format!("{}/", self.base_dir.display()),
+            )
         };
 
         let mut cmd = Command::new("rsync");
@@ -140,13 +159,14 @@ impl RsyncBackend {
         let mut cmd = self.build_command(push);
         cmd.stdin(Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| {
-            io::Error::new(e.kind(), format!("failed to spawn rsync: {}", e))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| io::Error::new(e.kind(), format!("failed to spawn rsync: {}", e)))?;
 
         {
             let stdin = child.stdin.as_mut().unwrap();
-            let list: Vec<u8> = files.iter()
+            let list: Vec<u8> = files
+                .iter()
                 .flat_map(|f| f.bytes().chain(std::iter::once(0u8)))
                 .collect();
             stdin.write_all(&list)?;
@@ -173,7 +193,6 @@ impl Backend for RsyncBackend {
     }
 }
 
-
 /// Load a backend from the `.gitfat` config file.
 ///
 /// `name` selects a specific section (e.g. "rsync" or "copy"); when `None`
@@ -186,9 +205,12 @@ pub fn load_backend(
     // We can use git2::Config for this since it is actually just a plain
     // INI-style parser.
     let cfg = git2::Config::open(config_path).map_err(|e| {
-        log::warn!("This does not appear to be a repository managed by git-fat. \
-                   Missing config file at: {}", config_path.display());
-        io::Error::new(io::ErrorKind::Other, format!("cannot open {}: {}", config_path.display(), e))
+        log::warn!(
+            "This does not appear to be a repository managed by git-fat. \
+                   Missing config file at: {}",
+            config_path.display()
+        );
+        other_err(format!("cannot open {}: {}", config_path.display(), e))
     })?;
 
     // Collect all (section, key, value) entries so we can find sections.
@@ -199,19 +221,27 @@ pub fn load_backend(
     } else {
         // Scan entries to find the first top-level section name.
         let mut found: Option<String> = None;
-        let entries = cfg.entries(None).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        entries.for_each(|entry| {
-            if found.is_some() {
-                return;
-            }
-            if let Some(name) = entry.name() {
-                if let Some(sec) = name.split('.').next() {
-                    found = Some(sec.to_string());
+        let entries = cfg.entries(None).map_err(other_err)?;
+        entries
+            .for_each(|entry| {
+                if found.is_some() {
+                    return;
                 }
-            }
-        }).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                if let Some(name) = entry.name() {
+                    if let Some(sec) = name.split('.').next() {
+                        found = Some(sec.to_string());
+                    }
+                }
+            })
+            .map_err(other_err)?;
         found.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("no backend configuration found in {}", config_path.display()))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no backend configuration found in {}",
+                    config_path.display()
+                ),
+            )
         })?
     };
 
@@ -228,7 +258,9 @@ pub fn load_backend(
         "rsync" => {
             let ssh_user = cfg.get_string(&format!("{}.sshuser", section)).ok();
             let ssh_port = cfg.get_string(&format!("{}.sshport", section)).ok();
-            Ok(Box::new(RsyncBackend::new(base_dir, &remote, ssh_user, ssh_port)))
+            Ok(Box::new(RsyncBackend::new(
+                base_dir, &remote, ssh_user, ssh_port,
+            )))
         }
         other => Err(io::Error::new(
             io::ErrorKind::Unsupported,

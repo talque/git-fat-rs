@@ -1,5 +1,5 @@
 use log;
-use sha1::{Sha1, Digest};
+use sha1::{Digest, Sha1};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -9,13 +9,13 @@ use tempfile::NamedTempFile;
 use git2::{self, Repository, TreeWalkMode, TreeWalkResult};
 
 use crate::backend::{self, Backend};
+use crate::util::other_err;
 
-pub const BLOCK_SIZE: usize = 4096 * 1024;  // 4MB
+pub const BLOCK_SIZE: usize = 4096 * 1024; // 4MB
 pub const PREFIX_SIZE: usize = 1024;
 pub const COOKIE: &str = "#$# git-fat ";
 // Length of a git-fat placeholder: COOKIE + 40-hex + ' ' + 20-padded-decimal + '\n'
 pub const MAGICLEN: usize = 74;
-
 
 pub struct GitFat {
     repo: git2::Repository,
@@ -26,7 +26,6 @@ pub struct GitFat {
     #[allow(dead_code)]
     debug: bool,
 }
-
 
 impl GitFat {
     pub fn new(verbose: bool, debug: bool, config_path: Option<PathBuf>) -> io::Result<Self> {
@@ -40,7 +39,13 @@ impl GitFat {
                 .join(".gitfat")
         });
 
-        let gf = GitFat{ repo, obj_dir, config_path, verbose, debug };
+        let gf = GitFat {
+            repo,
+            obj_dir,
+            config_path,
+            verbose,
+            debug,
+        };
         gf.configure()?;
         Ok(gf)
     }
@@ -54,13 +59,16 @@ impl GitFat {
 
         if cfg.get_string("filter.fat.clean").is_ok()
             && cfg.get_string("filter.fat.smudge").is_ok()
-            && self.obj_dir.is_dir() {
+            && self.obj_dir.is_dir()
+        {
             return Ok(());
         }
 
         println!("Setting filters in .git/config");
-        cfg.set_str("filter.fat.clean", "git-fat filter-clean %f").map_err(other_err)?;
-        cfg.set_str("filter.fat.smudge", "git-fat filter-smudge %f").map_err(other_err)?;
+        cfg.set_str("filter.fat.clean", "git-fat filter-clean %f")
+            .map_err(other_err)?;
+        cfg.set_str("filter.fat.smudge", "git-fat filter-smudge %f")
+            .map_err(other_err)?;
         println!("Creating {}", self.obj_dir.display());
         fs::create_dir_all(&self.obj_dir)?;
 
@@ -69,8 +77,11 @@ impl GitFat {
     }
 
     pub fn filter_clean<R: Read, W: Write>(
-        &self, filename: Option<&str>, mut instream: R, mut outstream: W) -> io::Result<()> {
-
+        &self,
+        filename: Option<&str>,
+        mut instream: R,
+        mut outstream: W,
+    ) -> io::Result<()> {
         log::debug!("CLEAN: filename={filename:?}");
 
         if let Some(filename) = filename {
@@ -107,8 +118,11 @@ impl GitFat {
     }
 
     pub fn filter_smudge<R: Read, W: Write>(
-        &self, filename: Option<&str>, mut instream: R, mut outstream: W) -> io::Result<()> {
-
+        &self,
+        filename: Option<&str>,
+        mut instream: R,
+        mut outstream: W,
+    ) -> io::Result<()> {
         log::debug!("SMUDGE: filename={filename:?}");
         let objdir = &self.obj_dir;
         let first_block = read_prefix(&mut instream, PREFIX_SIZE)?;
@@ -117,7 +131,10 @@ impl GitFat {
             if objfile.exists() {
                 let mut f = File::open(&objfile)?;
                 io::copy(&mut f, &mut outstream)?;
-                log::info!("git-fat filter-smudge: restoring from {}", objfile.display());
+                log::info!(
+                    "git-fat filter-smudge: restoring from {}",
+                    objfile.display()
+                );
                 return Ok(());
             } else {
                 log::info!("git-fat filter-smudge: fat object not found in cache")
@@ -140,21 +157,27 @@ impl GitFat {
     /// Return (digest, repo-relative path) for working-tree files that still
     /// contain a fat placeholder (i.e. have not been smudged).
     pub fn orphan_files(&self) -> io::Result<Vec<(String, PathBuf)>> {
-        let workdir = self.repo.workdir()
+        let workdir = self
+            .repo
+            .workdir()
             .ok_or_else(|| other_err("no working directory"))?
             .to_path_buf();
 
         let mut orphans = Vec::new();
 
         self.walk_tree(|dir, entry, odb| {
-            if !is_fat_placeholder(entry, odb) { return Ok(()); }
+            if !is_fat_placeholder(entry, odb) {
+                return Ok(());
+            }
 
             let path = PathBuf::from(dir).join(entry.name().unwrap_or_default());
             let full_path = workdir.join(&path);
-            if !full_path.is_file() { return Ok(()); }
+            if !full_path.is_file() {
+                return Ok(());
+            }
 
-            let prefix = File::open(&full_path)
-                .and_then(|mut f| read_prefix(&mut f, PREFIX_SIZE))?;
+            let prefix =
+                File::open(&full_path).and_then(|mut f| read_prefix(&mut f, PREFIX_SIZE))?;
             if let Ok(digest) = extract_digest(&prefix) {
                 orphans.push((digest, path));
             }
@@ -167,7 +190,9 @@ impl GitFat {
     /// Restore working-tree files that are still fat placeholders but whose
     /// objects are present in the local cache.
     pub fn checkout(&self, show_orphans: bool) -> io::Result<()> {
-        let workdir = self.repo.workdir()
+        let workdir = self
+            .repo
+            .workdir()
             .ok_or_else(|| other_err("no working directory"))?
             .to_path_buf();
 
@@ -191,7 +216,9 @@ impl GitFat {
     /// Find any files over a size threshold in the repository.
     pub fn find(&self, min_size: usize) -> io::Result<()> {
         self.walk_tree(|dir, entry, odb| {
-            if entry.kind() != Some(git2::ObjectType::Blob) { return Ok(()); }
+            if entry.kind() != Some(git2::ObjectType::Blob) {
+                return Ok(());
+            }
             if let Ok((size, _)) = odb.read_header(entry.id()) {
                 if size > min_size {
                     let path = PathBuf::from(dir).join(entry.name().unwrap_or_default());
@@ -205,7 +232,9 @@ impl GitFat {
     /// List all git-fat managed files: fat-digest and repo-relative path.
     pub fn list(&self) -> io::Result<()> {
         self.walk_tree(|dir, entry, odb| {
-            if !is_fat_placeholder(entry, odb) { return Ok(()); }
+            if !is_fat_placeholder(entry, odb) {
+                return Ok(());
+            }
             if let Ok(blob) = self.repo.find_blob(entry.id()) {
                 if let Ok(digest) = extract_digest(blob.content()) {
                     let path = PathBuf::from(dir).join(entry.name().unwrap_or_default());
@@ -219,7 +248,8 @@ impl GitFat {
     /// Push locally cached fat objects that are referenced in HEAD to the remote.
     pub fn push(&self, backend_name: Option<&str>) -> io::Result<()> {
         let backend = self.load_backend(backend_name)?;
-        let files: HashSet<String> = self.managed_objects()?
+        let files: HashSet<String> = self
+            .managed_objects()?
             .intersection(&self.cached_objects()?)
             .cloned()
             .collect();
@@ -234,7 +264,8 @@ impl GitFat {
     /// then checkout any newly available files.
     pub fn pull(&self, backend_name: Option<&str>) -> io::Result<()> {
         let backend = self.load_backend(backend_name)?;
-        let files: HashSet<String> = self.managed_objects()?
+        let files: HashSet<String> = self
+            .managed_objects()?
             .difference(&self.cached_objects()?)
             .cloned()
             .collect();
@@ -256,7 +287,9 @@ impl GitFat {
     /// placeholder blob.  Optionally appends `filter=fat -text` lines to
     /// `.gitattributes` in the index.
     pub fn index_filter(&self, filelist: &Path, update_gitattributes: bool) -> io::Result<()> {
-        let workdir = self.obj_dir.parent()
+        let workdir = self
+            .obj_dir
+            .parent()
             .ok_or_else(|| other_err("invalid object dir"))?
             .join("index-filter");
         fs::create_dir_all(&workdir)?;
@@ -298,7 +331,9 @@ impl GitFat {
         if update_gitattributes && !newfiles.is_empty() {
             let (ga_mode, ga_content) = match index.get_path(Path::new(".gitattributes"), 0) {
                 Some(e) => {
-                    let content = self.repo.find_blob(e.id)
+                    let content = self
+                        .repo
+                        .find_blob(e.id)
                         .map(|b| String::from_utf8_lossy(b.content()).to_string())
                         .unwrap_or_default();
                     (e.mode, content)
@@ -370,9 +405,7 @@ impl GitFat {
     fn head_tree(&self) -> io::Result<Option<git2::Tree<'_>>> {
         match self.repo.head() {
             Err(_) => Ok(None),
-            Ok(head) => Ok(Some(
-                head.peel_to_tree().map_err(other_err)?
-            )),
+            Ok(head) => Ok(Some(head.peel_to_tree().map_err(other_err)?)),
         }
     }
 
@@ -380,7 +413,9 @@ impl GitFat {
     fn managed_objects(&self) -> io::Result<HashSet<String>> {
         let mut set = HashSet::new();
         self.walk_tree(|_dir, entry, odb| {
-            if !is_fat_placeholder(entry, odb) { return Ok(()); }
+            if !is_fat_placeholder(entry, odb) {
+                return Ok(());
+            }
             if let Ok(blob) = self.repo.find_blob(entry.id()) {
                 if let Ok(digest) = extract_digest(blob.content()) {
                     set.insert(digest.trim().to_string());
@@ -407,30 +442,34 @@ impl GitFat {
         let walk_result = tree.walk(TreeWalkMode::PreOrder, |dir, entry| {
             match callback(dir, entry, &odb) {
                 Ok(()) => TreeWalkResult::Ok,
-                Err(e) => { walk_err = Some(e); TreeWalkResult::Abort }
+                Err(e) => {
+                    walk_err = Some(e);
+                    TreeWalkResult::Abort
+                }
             }
         });
 
-        if let Some(e) = walk_err { return Err(e); }
+        if let Some(e) = walk_err {
+            return Err(e);
+        }
         walk_result.map_err(other_err)
     }
 }
-
 
 /// Misc utility functions
 ///
 
 fn is_fat_placeholder(entry: &git2::TreeEntry<'_>, odb: &git2::Odb<'_>) -> bool {
     entry.kind() == Some(git2::ObjectType::Blob)
-        && odb.read_header(entry.id()).map_or(false, |(size, _)| size == MAGICLEN)
+        && odb
+            .read_header(entry.id())
+            .map_or(false, |(size, _)| size == MAGICLEN)
 }
-
 
 // Shared helpers used by both GitFat methods and standalone filter functions
 fn encode_placeholder(digest: &str, size: usize) -> Vec<u8> {
     format!("{}{} {:20}\n", COOKIE, digest, size).into_bytes()
 }
-
 
 fn read_prefix<R: Read>(reader: &mut R, size: usize) -> io::Result<Vec<u8>> {
     let mut first_block = vec![0u8; size];
@@ -438,7 +477,6 @@ fn read_prefix<R: Read>(reader: &mut R, size: usize) -> io::Result<Vec<u8>> {
     first_block.truncate(n);
     Ok(first_block)
 }
-
 
 fn extract_digest(block: &[u8]) -> Result<String, &str> {
     if !block.starts_with(COOKIE.as_bytes()) {
@@ -453,8 +491,9 @@ fn extract_digest(block: &[u8]) -> Result<String, &str> {
     Ok(String::from_utf8_lossy(parts[2]).to_string())
 }
 
-
-fn read_blocks<R: Read>(reader: &mut R) -> io::Result<impl Iterator<Item=io::Result<Vec<u8>>> + '_> {
+fn read_blocks<R: Read>(
+    reader: &mut R,
+) -> io::Result<impl Iterator<Item = io::Result<Vec<u8>>> + '_> {
     Ok(std::iter::from_fn(move || {
         let mut buf = vec![0u8; BLOCK_SIZE];
         match reader.read(&mut buf) {
@@ -463,11 +502,4 @@ fn read_blocks<R: Read>(reader: &mut R) -> io::Result<impl Iterator<Item=io::Res
             Err(e) => Some(Err(e)),
         }
     }))
-}
-
-
-/// Most functions return an io::Result so this is a helper to wrap arbitrary
-/// errors as io::Error with io::ErrorKind::Other.
-fn other_err(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e)
 }

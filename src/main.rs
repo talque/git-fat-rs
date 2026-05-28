@@ -1,5 +1,6 @@
 mod backend;
 mod fat;
+mod util;
 
 use clap::{Parser, Subcommand};
 use std::io;
@@ -98,13 +99,9 @@ fn main() -> io::Result<()> {
     let gf = fat::GitFat::new(cli.verbose, cli.debug, cli.config.clone())?;
 
     match &cli.command {
-        Command::Init => {
-            Ok(())
-        }
+        Command::Init => Ok(()),
 
-        Command::Checkout => {
-            gf.checkout(false)
-        }
+        Command::Checkout => gf.checkout(false),
 
         Command::FilterClean { filename } => {
             gf.filter_clean(filename.as_deref(), io::stdin(), io::stdout())
@@ -114,28 +111,21 @@ fn main() -> io::Result<()> {
             gf.filter_smudge(filename.as_deref(), io::stdin(), io::stdout())
         }
 
-        Command::Find { size } => {
-            gf.find(*size)
-        }
+        Command::Find { size } => gf.find(*size),
 
-        Command::List => {
-            gf.list()
-        }
+        Command::List => gf.list(),
 
-        Command::Status => {
-            gf.status()
-        }
+        Command::Status => gf.status(),
 
-        Command::Push { backend } => {
-            gf.push(backend.as_deref())
-        }
+        Command::Push { backend } => gf.push(backend.as_deref()),
 
-        Command::Pull { backend_or_pattern, .. } => {
-            gf.pull(backend_or_pattern.as_deref())
-        }
+        Command::Pull {
+            backend_or_pattern, ..
+        } => gf.pull(backend_or_pattern.as_deref()),
 
-        Command::IndexFilter { filelist, no_gitattributes } => {
-            gf.index_filter(filelist, !no_gitattributes)
-        }
+        Command::IndexFilter {
+            filelist,
+            no_gitattributes,
+        } => gf.index_filter(filelist, !no_gitattributes),
     }
 }
