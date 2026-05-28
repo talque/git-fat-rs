@@ -347,6 +347,7 @@ impl GitFat {
             }
 
             let ga_oid = self.repo.blob(new_ga.as_bytes()).map_err(other_err)?;
+            #[rustfmt::skip]
             index.add(&git2::IndexEntry {
                 ctime: git2::IndexTime::new(0, 0),
                 mtime: git2::IndexTime::new(0, 0),
